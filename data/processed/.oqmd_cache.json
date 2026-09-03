@@ -1,0 +1,22 @@
+{
+  "Ba2InCuO4": {
+    "raw_ehull": 0.003725784062500015,
+    "effective_ehull": 0.003725784062500015
+  },
+  "Ba2MnSe3": {
+    "raw_ehull": 0.0,
+    "effective_ehull": 0.0
+  },
+  "Ba2SnSe5": {
+    "raw_ehull": 0.0,
+    "effective_ehull": 0.0
+  },
+  "Ba2InBiSe5": {
+    "raw_ehull": 0.0,
+    "effective_ehull": 0.0
+  },
+  "Ba3Sb2Se7": {
+    "raw_ehull": 0.0,
+    "effective_ehull": 0.0
+  }
+}

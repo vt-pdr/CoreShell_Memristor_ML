@@ -1,80 +1,136 @@
+import os
+import sys
 import pandas as pd
 import numpy as np
 
-# =====================================================================
-# 1. LOAD TYPE-I PAIRS
-# =====================================================================
-input_file = "type_1_memristor_pairs.csv"
-print(f"Loading Type-I pairs from '{input_file}'...")
+print("=" * 70)
+print("     PHASE 3: AUDITED & REFACTORED ML FEATURE ENGINEERING ENGINE     ")
+print("=" * 70)
 
+# 1. PATH RESOLUTION 
 try:
-    df = pd.read_csv(input_file)
-except FileNotFoundError:
-    print(f"Error: Could not find '{input_file}'.")
-    exit()
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+except NameError:
+    curr = os.getcwd()
+    while curr != os.path.dirname(curr):
+        if os.path.exists(os.path.join(curr, "data")):
+            break
+        curr = os.path.dirname(curr)
+    PROJECT_ROOT = curr if os.path.exists(os.path.join(curr, "data")) else os.getcwd()
 
-print(f"Loaded {len(df):,} initial pairs.")
+INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "processed", "type_1_memristor_pairs.csv")
+RAW_FILE = os.path.join(PROJECT_ROOT, "data", "raw", "core_shell_parameters_full.csv")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, "ml_feature_matrix.csv")
 
-# =====================================================================
-# 2. BULLETPROOF DATA IMPUTATION (With Physical Fallbacks)
-# =====================================================================
-print("Imputing missing physical parameters...")
+if not os.path.exists(INPUT_FILE):
+    raise FileNotFoundError(f"Input file '{INPUT_FILE}' not found.")
 
-# If APIs failed and left columns entirely blank, the median is NaN.
-# We inject standard physical baselines to guarantee the matrix survives.
-fallbacks = {
-    'Core_Dielectric_Static': 10.0,      # Typical transition metal oxide dielectric
-    'Shell_Dielectric_Static': 10.0,
-    'Core_Formation_Energy_eV': -2.0,    # Typical stable formation energy
-    'Shell_Formation_Energy_eV': -2.0
-}
+print(f"Loading candidate pairs from: '{INPUT_FILE}'")
+df = pd.read_csv(INPUT_FILE)
 
-for col, fallback_val in fallbacks.items():
-    if df[col].isnull().all():
-        print(f"  -> WARNING: '{col}' is 100% empty. Injecting physical fallback: {fallback_val}")
-        df[col] = fallback_val
-    else:
-        median_val = df[col].median()
-        # Fallback just in case the median still returns NaN for some reason
-        if pd.isna(median_val):
-            median_val = fallback_val
-        df[col] = df[col].fillna(median_val)
+# 2. DEDUPLICATION
+identifiers = ['Core_MP_ID', 'Shell_MP_ID', 'Core_Formula', 'Shell_Formula']
+df = df.drop_duplicates(subset=['Core_MP_ID', 'Shell_MP_ID']).copy()
 
-# =====================================================================
-# 3. FEATURE ENGINEERING
-# =====================================================================
-print("Engineering physical features for ML ingestion...")
+# 3. DYNAMIC MERGE LOGIC
+form_core_col = 'Core_Formation_Energy_eV' if 'Core_Formation_Energy_eV' in df.columns else 'Core_Formation_Energy_per_atom_eV'
+form_shell_col = 'Shell_Formation_Energy_eV' if 'Shell_Formation_Energy_eV' in df.columns else 'Shell_Formation_Energy_per_atom_eV'
 
-df['Dielectric_Contrast_Ratio'] = df['Core_Dielectric_Static'] / df['Shell_Dielectric_Static']
-df['Defect_Gradient_eV'] = df['Shell_Formation_Energy_eV'] - df['Core_Formation_Energy_eV']
-df['Confinement_Asymmetry'] = df['dEc_eV'] / (df['dEv_eV'] + 1e-6) # 1e-6 prevents dividing by zero
-df['Effective_System_Gap_eV'] = df['Shell_Eg_bulk_eV'] 
+if (form_core_col not in df.columns or form_shell_col not in df.columns) and os.path.exists(RAW_FILE):
+    print("  -> Merging formation energy parameters from Phase 1 raw data...")
+    raw_preview = pd.read_csv(RAW_FILE, nrows=1).columns
+    raw_energy_col = 'Formation_Energy_per_atom_eV' if 'Formation_Energy_per_atom_eV' in raw_preview else 'Formation_Energy_eV'
+    
+    df_raw = pd.read_csv(RAW_FILE)[['MP_ID', raw_energy_col]].drop_duplicates(subset=['MP_ID'])
+    
+    if form_core_col not in df.columns:
+        df = df.merge(
+            df_raw.rename(columns={'MP_ID': 'Core_MP_ID', raw_energy_col: 'Core_Formation_Energy_eV'}),
+            on='Core_MP_ID', how='left'
+        )
+        form_core_col = 'Core_Formation_Energy_eV'
+        
+    if form_shell_col not in df.columns:
+        df = df.merge(
+            df_raw.rename(columns={'MP_ID': 'Shell_MP_ID', raw_energy_col: 'Shell_Formation_Energy_eV'}),
+            on='Shell_MP_ID', how='left'
+        )
+        form_shell_col = 'Shell_Formation_Energy_eV'
 
-# =====================================================================
-# 4. CLEANUP & EXPORT
-# =====================================================================
-print("Selecting final feature columns...")
+if ("per_atom" in form_core_col) != ("per_atom" in form_shell_col):
+    raise ValueError(f"Unit mismatch: Cannot compute driving force between {form_core_col} and {form_shell_col}.")
 
-identifiers = ['Core_Formula', 'Shell_Formula']
-
-# --- FIXED: Added Shell_Dielectric_Static to the final output ---
-ml_features = [
-    'Core_Eg_nano_3nm_eV', 'Shell_Eg_bulk_eV',
-    'dEc_eV', 'dEv_eV', 'Total_Confinement_eV',
-    'Shell_Dielectric_Static',  
-    'Dielectric_Contrast_Ratio', 'Defect_Gradient_eV', 
-    'Confinement_Asymmetry', 'Effective_System_Gap_eV'
+# 4. SCHEMA INTEGRITY CHECK
+required_cols = [
+    'Core_MP_ID', 'Shell_MP_ID', 'Core_Formula', 'Shell_Formula',
+    'Core_Eg_nano_3nm_eV', 'Shell_Eg_bulk_eV', 'dEc_eV', 'dEv_eV',
+    'Core_Dielectric_Static', 'Shell_Dielectric_Static',
+    form_core_col, form_shell_col
 ]
 
-final_ml_df = df[identifiers + ml_features].copy()
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise KeyError(f"Missing required schema columns: {missing_cols}")
 
-# Final sweep: replace infinities with NaN, then drop the tiny fraction of remaining bad rows
-final_ml_df = final_ml_df.replace([np.inf, -np.inf], np.nan).dropna()
+df = df.dropna(subset=required_cols).copy()
+df = df[(df['Core_Eg_nano_3nm_eV'] > 0) & (df['Shell_Eg_bulk_eV'] > 0)].copy()
 
-output_file = "ml_feature_matrix.csv"
-final_ml_df.to_csv(output_file, index=False)
+# 5. PHYSICAL FEATURE ENGINEERING
+print("Engineering composite physical descriptors...")
 
-print("\n==================================================")
-print(f"SUCCESS! Feature Matrix compiled with {len(final_ml_df):,} viable devices.")
-print(f"Saved ready-to-train dataset to '{output_file}'.")
-print("==================================================")
+denom_confinement = np.abs(df['dEc_eV']) + np.abs(df['dEv_eV'])
+df['Confinement_Asymmetry'] = np.where(
+    denom_confinement > 1e-6,
+    (df['dEc_eV'] - df['dEv_eV']) / denom_confinement,
+    0.0
+)
+
+# Standard features
+df['Log_Dielectric_Ratio'] = np.log(df['Core_Dielectric_Static'] / df['Shell_Dielectric_Static'])
+df['Log_Bandgap_Ratio'] = np.log(df['Core_Eg_nano_3nm_eV'] / df['Shell_Eg_bulk_eV'])
+df['Thermodynamic_Driving_Force_eV'] = df[form_shell_col] - df[form_core_col]
+
+# --- PHASE 4 REQUIRED FEATURES ---
+df['Total_Confinement_eV'] = df['dEc_eV'] + df['dEv_eV']
+df['Dielectric_Contrast_Ratio'] = df['Core_Dielectric_Static'] / df['Shell_Dielectric_Static']
+df['Defect_Gradient_eV'] = df['Thermodynamic_Driving_Force_eV'] 
+
+# 6. FEATURE MATRIX COMPILATION
+ml_features = [
+    'Core_Eg_nano_3nm_eV',
+    'Shell_Eg_bulk_eV',               # Added for Phase 4
+    'Total_Confinement_eV',           # Added for Phase 4
+    'Dielectric_Contrast_Ratio',      # Added for Phase 4
+    'Defect_Gradient_eV',             # Added for Phase 4
+    'dEc_eV',
+    'dEv_eV',
+    'Core_Dielectric_Static',
+    'Shell_Dielectric_Static',
+    'Log_Dielectric_Ratio',
+    'Thermodynamic_Driving_Force_eV',
+    'Confinement_Asymmetry',
+    'Log_Bandgap_Ratio'
+]
+
+final_df = df[identifiers + ml_features].copy()
+final_df = final_df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+
+if len(final_df) == 0:
+    raise ValueError("Feature compilation resulted in 0 valid rows.")
+
+X = final_df[ml_features].values
+X_std = (X - np.mean(X, axis=0)) / (np.std(X, axis=0) + 1e-12)
+rank = np.linalg.matrix_rank(X_std)
+total_features = len(ml_features)
+rank_status = "Full Rank" if rank == total_features else f"Rank Deficient ({rank}/{total_features})"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+final_df.to_csv(OUTPUT_FILE, index=False)
+
+print("\n" + "=" * 70)
+print(f"SUCCESS: Compiled clean feature matrix with {len(final_df):,} devices.")
+print(f"Matrix Rank: {rank} / {total_features} ({rank_status})")
+print(f"Saved output to: '{OUTPUT_FILE}'")
+print("=" * 70)

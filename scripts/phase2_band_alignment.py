@@ -1,81 +1,105 @@
+import os
+import sys
 import pandas as pd
-import numpy as np
+
+print("Initializing Phase 2 Band Alignment Engine...")
+sys.stdout.flush()
 
 # =====================================================================
-# 1. LOAD DATASET
+# 1. PATH RESOLUTION & DYNAMIC CONFIGURATION
 # =====================================================================
-input_file = "core_shell_parameters_full.csv"
-print(f"Loading materials data from {input_file}...")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-try:
-    df = pd.read_csv(input_file)
-except FileNotFoundError:
-    print(f"Error: Could not find '{input_file}'. Run Phase 1 first.")
-    exit()
+INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "raw", "core_shell_parameters_full.csv")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, "type_1_memristor_pairs.csv")
 
-# Drop rows that are missing crucial band alignment data
-df = df.dropna(subset=['CBM_bulk_eV', 'VBM_bulk_eV', 'Eg_nano_3nm_eV'])
-print(f"Loaded {len(df)} valid materials for pairing.")
+# Minimum physical potential barrier height to prevent room-temperature thermal leak (eV)
+MIN_BARRIER_OFFSET = 0.05  
 
-# =====================================================================
-# 2. GENERATE ALL POSSIBLE PAIRS (CARTESIAN PRODUCT)
-# =====================================================================
-print("\nCross-referencing all possible Core-Shell combinations...")
-
-# Add prefixes to distinguish Core vs Shell properties
-df_core = df.add_prefix('Core_')
-df_shell = df.add_prefix('Shell_')
-
-# Create a temporary merge key to force a cartesian product (every combo)
-df_core['merge_key'] = 1
-df_shell['merge_key'] = 1
-
-# Merge and drop the temporary key
-pairs = pd.merge(df_core, df_shell, on='merge_key').drop('merge_key', axis=1)
-
-# Remove identical material pairings (e.g., TiO2 core with TiO2 shell)
-pairs = pairs[pairs['Core_Formula'] != pairs['Shell_Formula']]
-print(f"Generated {len(pairs):,} unique material pairs.")
+# Effective mass confinement distribution ratio (m_e* = 0.2, m_h* = 0.8)
+# Confinement shifts CBM upward by 80% of dEg, VBM downward by 20% of dEg
+CBM_CONFINEMENT_RATIO = 0.8  
+VBM_CONFINEMENT_RATIO = 0.2  
 
 # =====================================================================
-# 3. CALCULATE BAND OFFSETS & FILTER TYPE-I
+# 2. DATA INGESTION & VALIDATION
 # =====================================================================
-print("Calculating Conduction and Valence Band Offsets...")
+if not os.path.exists(INPUT_FILE):
+    print(f"CRITICAL ERROR: Input file not found at '{INPUT_FILE}'.")
+    print("Please ensure Phase 1 generated 'data/raw/core_shell_parameters_full.csv'.")
+    sys.exit(1)
 
-# Conduction Band Offset (CBO) = Shell CBM - Core CBM
-pairs['dEc_eV'] = pairs['Shell_CBM_bulk_eV'] - pairs['Core_CBM_bulk_eV']
-
-# Valence Band Offset (VBO) = Core VBM - Shell VBM 
-pairs['dEv_eV'] = pairs['Core_VBM_bulk_eV'] - pairs['Shell_VBM_bulk_eV']
-
-print("Filtering for strict Type-I (Straddling) Band Alignment...")
-# For Type-I, both offsets must be positive (Shell encompasses Core)
-type_1_pairs = pairs[(pairs['dEc_eV'] > 0) & (pairs['dEv_eV'] > 0)].copy()
-
-# Sort by the most confining shells (highest combined barriers)
-type_1_pairs['Total_Confinement_eV'] = type_1_pairs['dEc_eV'] + type_1_pairs['dEv_eV']
-type_1_pairs = type_1_pairs.sort_values(by='Total_Confinement_eV', ascending=False)
+print(f"Loading Phase 1 materials dataset from: {INPUT_FILE}")
+df_materials = pd.read_csv(INPUT_FILE)
+print(f"Total candidate materials loaded: {len(df_materials)}")
 
 # =====================================================================
-# 4. EXPORT RESULTS
+# 3. TYPE-I BAND ALIGNMENT ENGINE (Nanoscale Corrected)
 # =====================================================================
-# Select the most important columns for the final dataset
-output_cols = [
-    'Core_Formula', 'Shell_Formula', 
-    'Core_Eg_nano_3nm_eV', 'Shell_Eg_bulk_eV',
-    'Core_Formation_Energy_eV', 'Shell_Formation_Energy_eV',
-    'Core_Dielectric_Static', 'Shell_Dielectric_Static',
-    'dEc_eV', 'dEv_eV', 'Total_Confinement_eV'
-]
+pairs = []
+materials_list = df_materials.to_dict('records')
 
-final_df = type_1_pairs[output_cols]
+print(f"\nEvaluating Type-I Core-Shell combinations across {len(materials_list)**2} permutations...")
 
-output_file = "type_1_memristor_pairs.csv"
-final_df.to_csv(output_file, index=False)
+for core in materials_list:
+    # 1. Calculate quantum confinement shift for the core
+    dEg_core = core['Eg_nano_3nm_eV'] - core['Eg_bulk_eV']
+    
+    # Shift core band edges dynamically based on quantum confinement
+    core_cbm_nano = core['CBM_bulk_eV'] + (dEg_core * CBM_CONFINEMENT_RATIO)
+    core_vbm_nano = core['VBM_bulk_eV'] - (dEg_core * VBM_CONFINEMENT_RATIO)
 
-print("\n==================================================")
-print(f"SUCCESS! Found {len(final_df):,} viable Type-I Core-Shell pairs.")
-print(f"Data saved to '{output_file}'.")
-print("==================================================")
-print("\nTop 5 Most Confining Pairs:")
-print(final_df[['Core_Formula', 'Shell_Formula', 'dEc_eV', 'dEv_eV', 'Total_Confinement_eV']].head())
+    for shell in materials_list:
+        # Prevent self-pairing (same material for core and shell)
+        if core['MP_ID'] == shell['MP_ID']:
+            continue
+            
+        # Shell is treated as bulk outer barrier matrix
+        shell_cbm = shell['CBM_bulk_eV']
+        shell_vbm = shell['VBM_bulk_eV']
+        
+        # Calculate true nanoscale conduction and valence band offsets
+        dEc = shell_cbm - core_cbm_nano
+        dEv = core_vbm_nano - shell_vbm
+        
+        # Strict Type-I Heterojunction condition:
+        # Both electron and hole must be trapped inside the core (dEc > 0 and dEv > 0)
+        if dEc >= MIN_BARRIER_OFFSET and dEv >= MIN_BARRIER_OFFSET:
+            pairs.append({
+                "Core_Formula": core['Formula'],
+                "Core_MP_ID": core['MP_ID'],
+                "Core_Eg_bulk_eV": core['Eg_bulk_eV'],
+                "Core_Eg_nano_3nm_eV": core['Eg_nano_3nm_eV'],
+                "Core_CBM_nano_eV": round(core_cbm_nano, 4),
+                "Core_VBM_nano_eV": round(core_vbm_nano, 4),
+                "Core_Dielectric_Static": core['Dielectric_Static'],
+                "Core_Dielectric_Source": core.get('Dielectric_Source', 'Unknown'),
+                
+                "Shell_Formula": shell['Formula'],
+                "Shell_MP_ID": shell['MP_ID'],
+                "Shell_Eg_bulk_eV": shell['Eg_bulk_eV'],
+                "Shell_CBM_bulk_eV": shell['CBM_bulk_eV'],
+                "Shell_VBM_bulk_eV": shell['VBM_bulk_eV'],
+                "Shell_Dielectric_Static": shell['Dielectric_Static'],
+                "Shell_Dielectric_Source": shell.get('Dielectric_Source', 'Unknown'),
+                
+                "dEc_eV": round(dEc, 4),
+                "dEv_eV": round(dEv, 4),
+                "Total_Confinement_eV": round(dEc + dEv, 4)
+            })
+
+df_pairs = pd.DataFrame(pairs)
+
+# =====================================================================
+# 4. EXPORT & SUMMARY
+# =====================================================================
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+df_pairs.to_csv(OUTPUT_FILE, index=False)
+
+print("=" * 65)
+print(f"SUCCESS! Type-I Heterojunction pairing complete.")
+print(f"Valid Type-I Pairs Identified: {len(df_pairs)} / {len(materials_list)*(len(materials_list)-1)}")
+print(f"Output saved to: '{OUTPUT_FILE}'")
+print("=" * 65)
